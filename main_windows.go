@@ -1,0 +1,359 @@
+package main
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+)
+
+type entry struct {
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
+}
+type manifest struct {
+	Schema  int     `json:"schema"`
+	Version string  `json:"version"`
+	Files   []entry `json:"files"`
+}
+type config struct {
+	ManifestURL string `json:"manifestUrl"`
+}
+
+var client = &http.Client{
+	Timeout: 30 * time.Minute,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 || req.URL.Scheme != "https" {
+			return errors.New("invalid download redirect")
+		}
+		return nil
+	},
+}
+
+func main() {
+	worker := flag.Bool("worker", false, "internal: run from a temporary directory")
+	directory := flag.String("install-dir", "", "AffdataEdit installation directory")
+	source := flag.String("manifest-url", "", "HTTPS URL of windows/latest.json")
+	flag.Parse()
+	if err := run(*worker, *directory, *source); err != nil {
+		fmt.Fprintln(os.Stderr, "更新失败：", err)
+		fmt.Println("按 Enter 关闭。")
+		_, _ = fmt.Scanln()
+		os.Exit(1)
+	}
+}
+
+func run(worker bool, directory, source string) error {
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	if directory == "" {
+		directory = filepath.Dir(self)
+	}
+	directory, err = filepath.Abs(directory)
+	if err != nil {
+		return err
+	}
+	if !worker {
+		// Running outside the installation lets us replace the updater itself.
+		temp, err := os.MkdirTemp("", "AffdataEdit-Updater-")
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(temp)
+		copyPath := filepath.Join(temp, "AffdataEdit-Updater.exe")
+		if err = copyFile(self, copyPath); err != nil {
+			return err
+		}
+		cmd := exec.Command(copyPath, "--worker", "--install-dir", directory, "--manifest-url", source)
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+		// Parent must exit before its installed executable can be replaced.
+		if err = cmd.Start(); err != nil {
+			return err
+		}
+		// Windows cannot unlink an executing image. The worker cleans its directory
+		// on the next run through normal system temporary-file cleanup.
+		os.Exit(0)
+	}
+	if source == "" {
+		data, err := os.ReadFile(filepath.Join(directory, "updater-config.json"))
+		if err != nil {
+			return fmt.Errorf("read updater-config.json: %w", err)
+		}
+		var settings config
+		if err = json.Unmarshal(data, &settings); err != nil {
+			return err
+		}
+		source = settings.ManifestURL
+	}
+	parsed, err := url.Parse(source)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("manifest URL must be HTTPS without a query or fragment")
+	}
+	// Deny concurrent updaters; the OS releases this handle even after a crash.
+	lockName, err := syscall.UTF16PtrFromString(filepath.Join(directory, ".affdata-update.lock"))
+	if err != nil {
+		return err
+	}
+	lock, err := syscall.CreateFile(lockName, syscall.GENERIC_READ|syscall.GENERIC_WRITE, 0, nil, syscall.OPEN_ALWAYS, syscall.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		return fmt.Errorf("cannot lock installation (another updater or no write permission): %w", err)
+	}
+	defer syscall.CloseHandle(lock)
+	fmt.Println("正在检查更新…")
+	body, err := get(source)
+	if err != nil {
+		return err
+	}
+	var remote manifest
+	err = json.NewDecoder(io.LimitReader(body, 16<<20)).Decode(&remote)
+	body.Close()
+	if err != nil {
+		return err
+	}
+	if remote.Schema != 1 || remote.Version == "" || len(remote.Files) == 0 {
+		return errors.New("unsupported or empty manifest")
+	}
+	seen := map[string]bool{}
+	for _, file := range remote.Files {
+		if err = validate(directory, file); err != nil {
+			return err
+		}
+		key := strings.ToLower(file.Path)
+		if seen[key] {
+			return fmt.Errorf("duplicate path: %s", file.Path)
+		}
+		seen[key] = true
+	}
+	if !seen["affdataedit.exe"] {
+		return errors.New("manifest does not contain AffdataEdit.exe")
+	}
+	stage, err := os.MkdirTemp(directory, ".affdata-update-")
+	if err != nil {
+		return err
+	}
+	keepStage := false
+	defer func() {
+		if !keepStage {
+			os.RemoveAll(stage)
+		}
+	}()
+	var changes []entry
+	for _, file := range remote.Files {
+		target := filepath.Join(directory, filepath.FromSlash(file.Path))
+		equal, err := matches(target, file)
+		if err != nil {
+			return err
+		}
+		if equal {
+			continue
+		}
+		fmt.Println("下载：", file.Path)
+		objectURL := parsed.ResolveReference(&url.URL{Path: "objects/" + file.SHA256}).String()
+		destination := filepath.Join(stage, "new", filepath.FromSlash(file.Path))
+		if err = download(objectURL, destination, file); err != nil {
+			return err
+		}
+		changes = append(changes, file)
+	}
+	if len(changes) == 0 {
+		fmt.Println("所有文件已是最新版本。")
+	} else {
+		fmt.Printf("%d 个文件需要更新。请先保存并关闭 AffdataEdit，再按 Enter 继续。\n", len(changes))
+		_, _ = fmt.Scanln()
+		player := filepath.Join(directory, "AffdataEdit.exe")
+		if _, statErr := os.Stat(player); statErr == nil {
+			name, err := syscall.UTF16PtrFromString(player)
+			if err != nil {
+				return err
+			}
+			handle, err := syscall.CreateFile(name, syscall.GENERIC_READ|syscall.GENERIC_WRITE, 0, nil, syscall.OPEN_EXISTING, syscall.FILE_ATTRIBUTE_NORMAL, 0)
+			if err != nil {
+				return fmt.Errorf("please close AffdataEdit before updating: %w", err)
+			}
+			syscall.CloseHandle(handle)
+		} else if !os.IsNotExist(statErr) {
+			return statErr
+		}
+		if err = apply(directory, stage, changes); err != nil {
+			keepStage = true
+			return fmt.Errorf("%w; backup retained at %s", err, stage)
+		}
+		fmt.Println("更新完成：", remote.Version)
+	}
+	cmd := exec.Command(filepath.Join(directory, "AffdataEdit.exe"))
+	cmd.Dir = directory
+	return cmd.Start()
+}
+
+func validate(root string, file entry) error {
+	if file.Size < 0 || file.Size > 1<<40 || len(file.SHA256) != 64 {
+		return errors.New("invalid file metadata")
+	}
+	if _, err := hex.DecodeString(file.SHA256); err != nil {
+		return err
+	}
+	if file.Path == "" || strings.ContainsAny(file.Path, "\\:<>\"|?*\x00") {
+		return fmt.Errorf("unsafe path: %q", file.Path)
+	}
+	current := root
+	for _, part := range strings.Split(file.Path, "/") {
+		base := strings.ToUpper(strings.SplitN(part, ".", 2)[0])
+		reserved := base == "CON" || base == "PRN" || base == "AUX" || base == "NUL" ||
+			(len(base) == 4 && (strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) && base[3] >= '0' && base[3] <= '9')
+		if part == "" || part == "." || part == ".." || strings.HasSuffix(part, ".") || strings.HasSuffix(part, " ") || strings.HasPrefix(strings.ToLower(part), ".affdata-update") || reserved {
+			return fmt.Errorf("unsafe path: %q", file.Path)
+		}
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if err == nil && info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing linked path: %s", current)
+		}
+	}
+	return nil
+}
+
+func matches(path string, file entry) (bool, error) {
+	f, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() {
+		return false, fmt.Errorf("not a regular file: %s", path)
+	}
+	if info.Size() != file.Size {
+		return false, nil
+	}
+	hash := sha256.New()
+	if _, err = io.Copy(hash, f); err != nil {
+		return false, err
+	}
+	return strings.EqualFold(hex.EncodeToString(hash.Sum(nil)), file.SHA256), nil
+}
+
+func get(address string) (io.ReadCloser, error) {
+	response, err := client.Get(address)
+	if err != nil {
+		return nil, err
+	}
+	if response.StatusCode != http.StatusOK {
+		response.Body.Close()
+		return nil, fmt.Errorf("HTTP %d downloading %s", response.StatusCode, address)
+	}
+	return response.Body, nil
+}
+
+func download(address, path string, file entry) error {
+	body, err := get(address)
+	if err != nil {
+		return err
+	}
+	defer body.Close()
+	if err = os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	out, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, io.LimitReader(body, file.Size+1))
+	closeErr := out.Close()
+	if err = errors.Join(copyErr, closeErr); err != nil {
+		return err
+	}
+	ok, err := matches(path, file)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("hash/size mismatch: %s", file.Path)
+	}
+	return nil
+}
+
+func copyFile(source, destination string) error {
+	in, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(destination)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, in)
+	return errors.Join(copyErr, out.Close())
+}
+
+func apply(root, stage string, files []entry) (result error) {
+	type change struct {
+		target, backup   string
+		installed, saved bool
+	}
+	var completed []*change
+	defer func() {
+		if result == nil {
+			return
+		}
+		for i := len(completed) - 1; i >= 0; i-- {
+			c := completed[i]
+			if c.installed {
+				result = errors.Join(result, os.Remove(c.target))
+			}
+			if c.saved {
+				result = errors.Join(result, os.Rename(c.backup, c.target))
+			}
+		}
+	}()
+	for _, file := range files {
+		if err := validate(root, file); err != nil {
+			return err
+		}
+		relative := filepath.FromSlash(file.Path)
+		c := &change{target: filepath.Join(root, relative), backup: filepath.Join(stage, "old", relative)}
+		completed = append(completed, c)
+		if err := os.MkdirAll(filepath.Dir(c.backup), 0755); err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(c.target), 0755); err != nil {
+			return err
+		}
+		if _, err := os.Stat(c.target); err == nil {
+			if err = os.Rename(c.target, c.backup); err != nil {
+				return err
+			}
+			c.saved = true
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		if err := os.Rename(filepath.Join(stage, "new", relative), c.target); err != nil {
+			return err
+		}
+		c.installed = true
+	}
+	return nil
+}

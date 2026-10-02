@@ -1,0 +1,45 @@
+# AffdataEdit Updater
+
+Windows x64 的文件级增量更新器，不依赖 Unity 或额外运行时。
+
+把 Release 中的 `AffdataEdit-Updater.exe` 放在 `AffdataEdit.exe` 同级目录，
+并提供 `updater-config.json`：
+
+```json
+{"manifestUrl":"https://YOUR-DOWNLOAD-DOMAIN/windows/latest.json"}
+```
+
+双击更新器。它会复制自己到临时目录运行，读取清单，比对本地文件的 SHA-256，
+只下载缺失或不同的文件。全部下载并校验后，提示保存并关闭编辑器，按 Enter
+安装并启动新版。不删除本地额外文件。同名自定义文件会按远程清单覆盖。
+
+替换发生错误时回滚本轮已替换文件，并显示备份目录。
+第一版不提供断电恢复日志或运行健康检查；强制终止时可从
+安装目录 `.affdata-update-*/old` 恢复备份。需要安装目录写权限。
+临时运行的 exe 留在系统临时目录，可在退出后清理。
+
+也可以指定 `--install-dir` 和 `--manifest-url`。
+仅使用 HTTPS，无客户端 R2 凭据。服务器发布清单前必须先完成所有文件上传。
+
+## 清单格式
+
+```json
+{
+  "schema": 1,
+  "version": "git-commit-sha",
+  "files": [
+    {"path": "AffdataEdit.exe", "sha256": "64位小写SHA256", "size": 12345}
+  ]
+}
+```
+
+文件对象路径为清单同级的 `objects/<sha256>`；版本目录中的归档清单用于审计，
+客户端应使用 `windows/latest.json`。HTTP/哈希校验失败时不会替换任何程序文件。
+Unity 大型资源文件有一个字节改变也会下载整个文件，当前不是二进制差分。
+
+## 构建与发布
+
+`GOOS=windows GOARCH=amd64 go build -trimpath -o AffdataEdit-Updater.exe .`
+
+每次 push 到 master，在 Windows runner 执行 `go vet` 和编译，成功后自动发布
+exe 与 SHA256SUMS。新 Release 发布成功后删除旧 Release 和其标签，只保留最新一版。

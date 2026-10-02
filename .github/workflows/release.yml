@@ -1,0 +1,50 @@
+name: Windows updater release
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: updater-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Compile and check
+        shell: pwsh
+        run: |
+          go vet ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go test ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go build -trimpath -ldflags="-s -w" -o AffdataEdit-Updater.exe .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $hash = (Get-FileHash AffdataEdit-Updater.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  AffdataEdit-Updater.exe" | Set-Content -Encoding utf8NoBOM SHA256SUMS
+      - name: Publish latest release and remove previous releases
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "build-${env:GITHUB_RUN_NUMBER}-${env:GITHUB_RUN_ATTEMPT}"
+          gh release create $tag AffdataEdit-Updater.exe SHA256SUMS --target $env:GITHUB_SHA --title "Windows updater $tag" --notes "Windows x64. Commit: $env:GITHUB_SHA" --latest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tags = gh api --paginate "repos/$env:GITHUB_REPOSITORY/releases" --jq '.[].tag_name'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($old in $tags) {
+            if ($old -ne $tag) {
+              gh release delete $old --yes --cleanup-tag
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+          }
