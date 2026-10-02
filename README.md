@@ -2,8 +2,11 @@
 
 Windows x64 的文件级增量更新器，不依赖 Unity 或额外运行时。
 
-把 Release 中的 `AffdataEdit-Updater.exe` 放在 `AffdataEdit.exe` 同级目录，
-并提供 `updater-config.json`：
+首次安装：把 Release 中的 `AffdataEdit-Updater.exe` 放到一个可写的空目录，双击，
+更新器从内置的 AffdataEdit R2 地址下载完整程序。已有安装：放在 `AffdataEdit.exe`
+同级目录，双击进行增量更新。
+
+如需覆盖内置下载地址，可以提供 `updater-config.json`：
 
 ```json
 {"manifestUrl":"https://YOUR-DOWNLOAD-DOMAIN/windows/latest.json"}

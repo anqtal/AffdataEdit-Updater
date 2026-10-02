@@ -32,6 +32,8 @@ type config struct {
 	ManifestURL string `json:"manifestUrl"`
 }
 
+const defaultManifestURL = "https://pub-155d0648defb479e9230bc846a4fa5b8.r2.dev/windows/latest.json"
+
 var client = &http.Client{
 	Timeout: 30 * time.Minute,
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -90,14 +92,17 @@ func run(worker bool, directory, source string) error {
 	}
 	if source == "" {
 		data, err := os.ReadFile(filepath.Join(directory, "updater-config.json"))
-		if err != nil {
+		if os.IsNotExist(err) {
+			source = defaultManifestURL
+		} else if err != nil {
 			return fmt.Errorf("read updater-config.json: %w", err)
+		} else {
+			var settings config
+			if err = json.Unmarshal(data, &settings); err != nil {
+				return err
+			}
+			source = settings.ManifestURL
 		}
-		var settings config
-		if err = json.Unmarshal(data, &settings); err != nil {
-			return err
-		}
-		source = settings.ManifestURL
 	}
 	parsed, err := url.Parse(source)
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
