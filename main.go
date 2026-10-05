@@ -14,7 +14,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -22,6 +21,8 @@ type entry struct {
 	Path   string `json:"path"`
 	SHA256 string `json:"sha256"`
 	Size   int64  `json:"size"`
+	// Set for macOS programs and libraries that must keep their execute permission.
+	Executable bool `json:"executable,omitempty"`
 }
 type manifest struct {
 	Schema  int     `json:"schema"`
@@ -32,7 +33,7 @@ type config struct {
 	ManifestURL string `json:"manifestUrl"`
 }
 
-const defaultManifestURL = "https://pub-155d0648defb479e9230bc846a4fa5b8.r2.dev/windows/latest.json"
+const defaultManifestURL = "https://pub-155d0648defb479e9230bc846a4fa5b8.r2.dev/" + platform + "/latest.json"
 
 var client = &http.Client{
 	Timeout: 30 * time.Minute,
@@ -47,7 +48,7 @@ var client = &http.Client{
 func main() {
 	worker := flag.Bool("worker", false, "internal: run from a temporary directory")
 	directory := flag.String("install-dir", "", "AffdataEdit installation directory")
-	source := flag.String("manifest-url", "", "HTTPS URL of windows/latest.json")
+	source := flag.String("manifest-url", "", "HTTPS URL of "+platform+"/latest.json")
 	flag.Parse()
 	if err := run(*worker, *directory, *source); err != nil {
 		fmt.Fprintln(os.Stderr, "更新失败：", err)
@@ -63,20 +64,20 @@ func run(worker bool, directory, source string) error {
 		return err
 	}
 	if directory == "" {
-		directory = filepath.Dir(self)
+		directory = defaultInstallDir(self)
 	}
 	directory, err = filepath.Abs(directory)
 	if err != nil {
 		return err
 	}
-	if !worker {
+	if !worker && runFromCopy {
 		// Running outside the installation lets us replace the updater itself.
 		temp, err := os.MkdirTemp("", "AffdataEdit-Updater-")
 		if err != nil {
 			return err
 		}
 		defer os.RemoveAll(temp)
-		copyPath := filepath.Join(temp, "AffdataEdit-Updater.exe")
+		copyPath := filepath.Join(temp, filepath.Base(self))
 		if err = copyFile(self, copyPath); err != nil {
 			return err
 		}
@@ -91,7 +92,7 @@ func run(worker bool, directory, source string) error {
 		os.Exit(0)
 	}
 	if source == "" {
-		data, err := os.ReadFile(filepath.Join(directory, "updater-config.json"))
+		data, err := os.ReadFile(filepath.Join(directory, appDir, "updater-config.json"))
 		if os.IsNotExist(err) {
 			source = defaultManifestURL
 		} else if err != nil {
@@ -108,16 +109,15 @@ func run(worker bool, directory, source string) error {
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return errors.New("manifest URL must be HTTPS without a query or fragment")
 	}
-	// Deny concurrent updaters; the OS releases this handle even after a crash.
-	lockName, err := syscall.UTF16PtrFromString(filepath.Join(directory, ".affdata-update.lock"))
-	if err != nil {
+	if err = os.MkdirAll(filepath.Join(directory, appDir), 0755); err != nil {
 		return err
 	}
-	lock, err := syscall.CreateFile(lockName, syscall.GENERIC_READ|syscall.GENERIC_WRITE, 0, nil, syscall.OPEN_ALWAYS, syscall.FILE_ATTRIBUTE_NORMAL, 0)
+	// Deny concurrent updaters; the OS releases the lock even after a crash.
+	unlock, err := lockInstallation(filepath.Join(directory, appDir, ".affdata-update.lock"))
 	if err != nil {
 		return fmt.Errorf("cannot lock installation (another updater or no write permission): %w", err)
 	}
-	defer syscall.CloseHandle(lock)
+	defer unlock()
 	fmt.Println("正在检查更新…")
 	body, err := get(source)
 	if err != nil {
@@ -143,10 +143,10 @@ func run(worker bool, directory, source string) error {
 		}
 		seen[key] = true
 	}
-	if !seen["affdataedit.exe"] {
-		return errors.New("manifest does not contain AffdataEdit.exe")
+	if !seen[strings.ToLower(playerPath)] {
+		return fmt.Errorf("manifest does not contain %s", playerPath)
 	}
-	stage, err := os.MkdirTemp(directory, ".affdata-update-")
+	stage, err := os.MkdirTemp(filepath.Join(directory, appDir), ".affdata-update-")
 	if err != nil {
 		return err
 	}
@@ -164,6 +164,10 @@ func run(worker bool, directory, source string) error {
 			return err
 		}
 		if equal {
+			// An identical file that lost its execute permission only needs it restored.
+			if err = setExecutable(target, file); err != nil {
+				return err
+			}
 			continue
 		}
 		fmt.Println("下载：", file.Path)
@@ -179,19 +183,8 @@ func run(worker bool, directory, source string) error {
 	} else {
 		fmt.Printf("%d 个文件需要更新。请先保存并关闭 AffdataEdit，再按 Enter 继续。\n", len(changes))
 		_, _ = fmt.Scanln()
-		player := filepath.Join(directory, "AffdataEdit.exe")
-		if _, statErr := os.Stat(player); statErr == nil {
-			name, err := syscall.UTF16PtrFromString(player)
-			if err != nil {
-				return err
-			}
-			handle, err := syscall.CreateFile(name, syscall.GENERIC_READ|syscall.GENERIC_WRITE, 0, nil, syscall.OPEN_EXISTING, syscall.FILE_ATTRIBUTE_NORMAL, 0)
-			if err != nil {
-				return fmt.Errorf("please close AffdataEdit before updating: %w", err)
-			}
-			syscall.CloseHandle(handle)
-		} else if !os.IsNotExist(statErr) {
-			return statErr
+		if err = ensureClosed(filepath.Join(directory, filepath.FromSlash(playerPath))); err != nil {
+			return err
 		}
 		if err = apply(directory, stage, changes); err != nil {
 			keepStage = true
@@ -199,9 +192,7 @@ func run(worker bool, directory, source string) error {
 		}
 		fmt.Println("更新完成：", remote.Version)
 	}
-	cmd := exec.Command(filepath.Join(directory, "AffdataEdit.exe"))
-	cmd.Dir = directory
-	return cmd.Start()
+	return launch(directory)
 }
 
 func validate(root string, file entry) error {
@@ -211,7 +202,7 @@ func validate(root string, file entry) error {
 	if _, err := hex.DecodeString(file.SHA256); err != nil {
 		return err
 	}
-	if file.Path == "" || strings.ContainsAny(file.Path, "\\:<>\"|?*\x00") {
+	if file.Path == "" || strings.ContainsAny(file.Path, "\\:<>\"|?*\x00") || !strings.HasPrefix(file.Path, appDir) {
 		return fmt.Errorf("unsafe path: %q", file.Path)
 	}
 	current := root
@@ -281,7 +272,11 @@ func download(address, path string, file entry) error {
 	if err = os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
-	out, err := os.Create(path)
+	var mode os.FileMode = 0644
+	if file.Executable {
+		mode = 0755
+	}
+	out, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
 		return err
 	}
@@ -298,6 +293,17 @@ func download(address, path string, file entry) error {
 		return fmt.Errorf("hash/size mismatch: %s", file.Path)
 	}
 	return nil
+}
+
+func setExecutable(path string, file entry) error {
+	if !file.Executable {
+		return nil
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Mode()&0111 == 0111 {
+		return err
+	}
+	return os.Chmod(path, info.Mode()|0111)
 }
 
 func copyFile(source, destination string) error {
