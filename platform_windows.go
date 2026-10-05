@@ -9,11 +9,9 @@ import (
 )
 
 const (
-	platform   = "windows"
-	playerPath = "AffdataEdit.exe"
-	appDir     = ""
-	// Windows cannot replace a running executable, so the updater runs from a temporary copy.
-	runFromCopy = true
+	platform    = "windows"
+	playerPath  = "AffdataEdit.exe"
+	updaterName = "AffdataEdit-Updater.exe"
 )
 
 // The updater lives beside AffdataEdit.exe; a first install uses the updater's directory.
@@ -49,6 +47,15 @@ func ensureClosed(player string) error {
 		return fmt.Errorf("please close AffdataEdit before updating: %w", err)
 	}
 	return syscall.CloseHandle(handle)
+}
+
+// Files the user added to the installation directory are kept.
+func extraFiles(directory string, remote manifest) ([]string, error) {
+	return nil, nil
+}
+
+func install(directory, stage string, changes []entry, extras []string) error {
+	return apply(directory, stage, changes)
 }
 
 func launch(directory string) error {

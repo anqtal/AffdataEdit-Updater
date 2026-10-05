@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -46,11 +45,10 @@ var client = &http.Client{
 }
 
 func main() {
-	worker := flag.Bool("worker", false, "internal: run from a temporary directory")
 	directory := flag.String("install-dir", "", "AffdataEdit installation directory")
 	source := flag.String("manifest-url", "", "HTTPS URL of "+platform+"/latest.json")
 	flag.Parse()
-	if err := run(*worker, *directory, *source); err != nil {
+	if err := run(*directory, *source); err != nil {
 		fmt.Fprintln(os.Stderr, "更新失败：", err)
 		fmt.Println("按 Enter 关闭。")
 		_, _ = fmt.Scanln()
@@ -58,7 +56,7 @@ func main() {
 	}
 }
 
-func run(worker bool, directory, source string) error {
+func run(directory, source string) error {
 	self, err := os.Executable()
 	if err != nil {
 		return err
@@ -70,29 +68,8 @@ func run(worker bool, directory, source string) error {
 	if err != nil {
 		return err
 	}
-	if !worker && runFromCopy {
-		// Running outside the installation lets us replace the updater itself.
-		temp, err := os.MkdirTemp("", "AffdataEdit-Updater-")
-		if err != nil {
-			return err
-		}
-		defer os.RemoveAll(temp)
-		copyPath := filepath.Join(temp, filepath.Base(self))
-		if err = copyFile(self, copyPath); err != nil {
-			return err
-		}
-		cmd := exec.Command(copyPath, "--worker", "--install-dir", directory, "--manifest-url", source)
-		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-		// Parent must exit before its installed executable can be replaced.
-		if err = cmd.Start(); err != nil {
-			return err
-		}
-		// Windows cannot unlink an executing image. The worker cleans its directory
-		// on the next run through normal system temporary-file cleanup.
-		os.Exit(0)
-	}
 	if source == "" {
-		data, err := os.ReadFile(filepath.Join(directory, appDir, "updater-config.json"))
+		data, err := os.ReadFile(filepath.Join(directory, "updater-config.json"))
 		if os.IsNotExist(err) {
 			source = defaultManifestURL
 		} else if err != nil {
@@ -109,11 +86,11 @@ func run(worker bool, directory, source string) error {
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return errors.New("manifest URL must be HTTPS without a query or fragment")
 	}
-	if err = os.MkdirAll(filepath.Join(directory, appDir), 0755); err != nil {
+	if err = os.MkdirAll(directory, 0755); err != nil {
 		return err
 	}
 	// Deny concurrent updaters; the OS releases the lock even after a crash.
-	unlock, err := lockInstallation(filepath.Join(directory, appDir, ".affdata-update.lock"))
+	unlock, err := lockInstallation(filepath.Join(directory, ".affdata-update.lock"))
 	if err != nil {
 		return fmt.Errorf("cannot lock installation (another updater or no write permission): %w", err)
 	}
@@ -146,7 +123,7 @@ func run(worker bool, directory, source string) error {
 	if !seen[strings.ToLower(playerPath)] {
 		return fmt.Errorf("manifest does not contain %s", playerPath)
 	}
-	stage, err := os.MkdirTemp(filepath.Join(directory, appDir), ".affdata-update-")
+	stage, err := os.MkdirTemp(directory, ".affdata-update-")
 	if err != nil {
 		return err
 	}
@@ -158,6 +135,10 @@ func run(worker bool, directory, source string) error {
 	}()
 	var changes []entry
 	for _, file := range remote.Files {
+		// AffdataEdit keeps the updater current; it never replaces itself.
+		if strings.EqualFold(file.Path, updaterName) {
+			continue
+		}
 		target := filepath.Join(directory, filepath.FromSlash(file.Path))
 		equal, err := matches(target, file)
 		if err != nil {
@@ -178,21 +159,50 @@ func run(worker bool, directory, source string) error {
 		}
 		changes = append(changes, file)
 	}
-	if len(changes) == 0 {
+	extras, err := extraFiles(directory, remote)
+	if err != nil {
+		return err
+	}
+	if len(changes) == 0 && len(extras) == 0 {
 		fmt.Println("所有文件已是最新版本。")
 	} else {
-		fmt.Printf("%d 个文件需要更新。请先保存并关闭 AffdataEdit，再按 Enter 继续。\n", len(changes))
+		fmt.Printf("%d 个文件需要更新。请先保存并关闭 AffdataEdit，再按 Enter 继续。\n", len(changes)+len(extras))
 		_, _ = fmt.Scanln()
 		if err = ensureClosed(filepath.Join(directory, filepath.FromSlash(playerPath))); err != nil {
 			return err
 		}
-		if err = apply(directory, stage, changes); err != nil {
+		if err = install(directory, stage, changes, extras); err != nil {
 			keepStage = true
 			return fmt.Errorf("%w; backup retained at %s", err, stage)
 		}
 		fmt.Println("更新完成：", remote.Version)
 	}
+	if err = installSelf(self, directory); err != nil {
+		fmt.Fprintln(os.Stderr, "无法把更新器复制到安装目录：", err)
+	}
 	return launch(directory)
+}
+
+// A first install copies the downloaded updater beside AffdataEdit, where AffdataEdit
+// keeps it up to date; the downloaded copy is no longer needed.
+func installSelf(self, directory string) error {
+	if resolved, err := filepath.EvalSymlinks(self); err == nil {
+		self = resolved
+	}
+	if filepath.Dir(self) == directory {
+		return nil
+	}
+	target := filepath.Join(directory, updaterName)
+	temp := target + ".new"
+	if err := copyFile(self, temp); err != nil {
+		os.Remove(temp)
+		return err
+	}
+	if err := os.Chmod(temp, 0755); err != nil {
+		os.Remove(temp)
+		return err
+	}
+	return os.Rename(temp, target)
 }
 
 func validate(root string, file entry) error {
@@ -202,7 +212,7 @@ func validate(root string, file entry) error {
 	if _, err := hex.DecodeString(file.SHA256); err != nil {
 		return err
 	}
-	if file.Path == "" || strings.ContainsAny(file.Path, "\\:<>\"|?*\x00") || !strings.HasPrefix(file.Path, appDir) {
+	if file.Path == "" || strings.ContainsAny(file.Path, "\\:<>\"|?*\x00") {
 		return fmt.Errorf("unsafe path: %q", file.Path)
 	}
 	current := root
