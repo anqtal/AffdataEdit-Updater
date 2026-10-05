@@ -64,7 +64,8 @@ jobs:
           $lines = foreach ($file in "AffdataEdit-Updater.exe", "AffdataEdit-Updater-macOS.zip") {
             "$((Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant())  $file"
           }
-          $lines | Set-Content -Encoding utf8NoBOM SHA256SUMS
+          # LF line endings, so shasum on macOS can check it too.
+          [IO.File]::WriteAllText("$PWD/SHA256SUMS", ($lines -join "`n") + "`n")
       - name: Publish latest release and remove previous releases
         shell: pwsh
         env:
