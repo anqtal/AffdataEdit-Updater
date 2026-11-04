@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -44,7 +45,10 @@ func ensureClosed(player string) error {
 	}
 	handle, err := syscall.CreateFile(name, syscall.GENERIC_READ|syscall.GENERIC_WRITE, 0, nil, syscall.OPEN_EXISTING, syscall.FILE_ATTRIBUTE_NORMAL, 0)
 	if err != nil {
-		return fmt.Errorf("please close AffdataEdit before updating: %w", err)
+		if errors.Is(err, syscall.Errno(32)) { // ERROR_SHARING_VIOLATION
+			return fmt.Errorf("%w: %v", errEditorRunning, err)
+		}
+		return err
 	}
 	return syscall.CloseHandle(handle)
 }
@@ -63,3 +67,5 @@ func launch(directory string) error {
 	cmd.Dir = directory
 	return cmd.Start()
 }
+
+func finishSuccess() error { return nil }

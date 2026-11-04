@@ -47,7 +47,7 @@ func ensureClosed(player string) error {
 	// pgrep exits with 1 when no process has this name.
 	err := exec.Command("pgrep", "-x", filepath.Base(player)).Run()
 	if err == nil {
-		return errors.New("please close AffdataEdit before updating")
+		return errEditorRunning
 	}
 	var exit *exec.ExitError
 	if errors.As(err, &exit) && exit.ExitCode() == 1 {
@@ -161,4 +161,33 @@ func install(directory, stage string, changes []entry, extras []string) (result 
 
 func launch(directory string) error {
 	return exec.Command("open", filepath.Join(directory, bundle)).Run()
+}
+
+func finishSuccess() error {
+	// Only close the Terminal tab hosting this updater, after our process has exited.
+	tty := exec.Command("/usr/bin/tty")
+	tty.Stdin = os.Stdin
+	output, err := tty.Output()
+	if err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && exit.ExitCode() == 1 {
+			return nil // No terminal when invoked in the background.
+		}
+		return err
+	}
+	script := fmt.Sprintf(`on run argv
+  do shell script "while kill -0 %d 2>/dev/null; do sleep 1; done"
+  tell application "Terminal"
+    repeat with w in windows
+      repeat with t in tabs of w
+        if tty of t is item 1 of argv then
+          close t
+          return
+        end if
+      end repeat
+    end repeat
+  end tell
+end run`, os.Getpid())
+	cmd := exec.Command("/usr/bin/osascript", "-e", script, strings.TrimSpace(string(output)))
+	return cmd.Start()
 }

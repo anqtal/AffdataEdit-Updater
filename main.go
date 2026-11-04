@@ -44,6 +44,8 @@ var client = &http.Client{
 	},
 }
 
+var errEditorRunning = errors.New("please close AffdataEdit before updating")
+
 func main() {
 	directory := flag.String("install-dir", "", "AffdataEdit installation directory")
 	source := flag.String("manifest-url", "", "HTTPS URL of "+platform+"/latest.json")
@@ -53,6 +55,9 @@ func main() {
 		fmt.Println("按 Enter 关闭。")
 		_, _ = fmt.Scanln()
 		os.Exit(1)
+	}
+	if err := finishSuccess(); err != nil {
+		fmt.Fprintln(os.Stderr, "无法自动关闭更新器窗口：", err)
 	}
 }
 
@@ -166,10 +171,21 @@ func run(directory, source string) error {
 	if len(changes) == 0 && len(extras) == 0 {
 		fmt.Println("所有文件已是最新版本。")
 	} else {
-		fmt.Printf("%d 个文件需要更新。请先保存并关闭 AffdataEdit，再按 Enter 继续。\n", len(changes)+len(extras))
-		_, _ = fmt.Scanln()
-		if err = ensureClosed(filepath.Join(directory, filepath.FromSlash(playerPath))); err != nil {
-			return err
+		fmt.Printf("%d 个文件需要更新。\n", len(changes)+len(extras))
+		waiting := false
+		for {
+			err = ensureClosed(filepath.Join(directory, filepath.FromSlash(playerPath)))
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, errEditorRunning) {
+				return err
+			}
+			if !waiting {
+				fmt.Println("请保存并关闭 AffdataEdit，关闭后将自动继续更新。")
+				waiting = true
+			}
+			time.Sleep(time.Second)
 		}
 		if err = install(directory, stage, changes, extras); err != nil {
 			keepStage = true
