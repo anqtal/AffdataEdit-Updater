@@ -228,16 +228,20 @@ func validate(root string, file entry) error {
 	if _, err := hex.DecodeString(file.SHA256); err != nil {
 		return err
 	}
-	if file.Path == "" || strings.ContainsAny(file.Path, "\\:<>\"|?*\x00") {
-		return fmt.Errorf("unsafe path: %q", file.Path)
+	return validatePath(root, file.Path)
+}
+
+func validatePath(root, path string) error {
+	if path == "" || strings.ContainsAny(path, "\\:<>\"|?*\x00") {
+		return fmt.Errorf("unsafe path: %q", path)
 	}
 	current := root
-	for _, part := range strings.Split(file.Path, "/") {
+	for _, part := range strings.Split(path, "/") {
 		base := strings.ToUpper(strings.SplitN(part, ".", 2)[0])
 		reserved := base == "CON" || base == "PRN" || base == "AUX" || base == "NUL" ||
 			(len(base) == 4 && (strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) && base[3] >= '0' && base[3] <= '9')
 		if part == "" || part == "." || part == ".." || strings.HasSuffix(part, ".") || strings.HasSuffix(part, " ") || strings.HasPrefix(strings.ToLower(part), ".affdata-update") || reserved {
-			return fmt.Errorf("unsafe path: %q", file.Path)
+			return fmt.Errorf("unsafe path: %q", path)
 		}
 		current = filepath.Join(current, part)
 		info, err := os.Lstat(current)
@@ -346,7 +350,7 @@ func copyFile(source, destination string) error {
 	return errors.Join(copyErr, out.Close())
 }
 
-func apply(root, stage string, files []entry) (result error) {
+func apply(root, stage string, files []entry, extras ...string) (result error) {
 	type change struct {
 		target, backup   string
 		installed, saved bool
@@ -366,28 +370,47 @@ func apply(root, stage string, files []entry) (result error) {
 			}
 		}
 	}()
+	save := func(path string) (*change, error) {
+		if err := validatePath(root, path); err != nil {
+			return nil, err
+		}
+		relative := filepath.FromSlash(path)
+		c := &change{target: filepath.Join(root, relative), backup: filepath.Join(stage, "old", relative)}
+		completed = append(completed, c)
+		if err := os.MkdirAll(filepath.Dir(c.backup), 0755); err != nil {
+			return nil, err
+		}
+		if info, err := os.Lstat(c.target); err == nil {
+			if !info.Mode().IsRegular() {
+				return nil, fmt.Errorf("not a regular file: %s", c.target)
+			}
+			if err = os.Rename(c.target, c.backup); err != nil {
+				return nil, err
+			}
+			c.saved = true
+		} else if !os.IsNotExist(err) {
+			return nil, err
+		}
+		return c, nil
+	}
+	// Removals share the replacement transaction: a failed install restores both.
+	for _, extra := range extras {
+		if _, err := save(extra); err != nil {
+			return err
+		}
+	}
 	for _, file := range files {
 		if err := validate(root, file); err != nil {
 			return err
 		}
-		relative := filepath.FromSlash(file.Path)
-		c := &change{target: filepath.Join(root, relative), backup: filepath.Join(stage, "old", relative)}
-		completed = append(completed, c)
-		if err := os.MkdirAll(filepath.Dir(c.backup), 0755); err != nil {
+		c, err := save(file.Path)
+		if err != nil {
 			return err
 		}
 		if err := os.MkdirAll(filepath.Dir(c.target), 0755); err != nil {
 			return err
 		}
-		if _, err := os.Stat(c.target); err == nil {
-			if err = os.Rename(c.target, c.backup); err != nil {
-				return err
-			}
-			c.saved = true
-		} else if !os.IsNotExist(err) {
-			return err
-		}
-		if err := os.Rename(filepath.Join(stage, "new", relative), c.target); err != nil {
+		if err := os.Rename(filepath.Join(stage, "new", filepath.FromSlash(file.Path)), c.target); err != nil {
 			return err
 		}
 		c.installed = true

@@ -53,13 +53,13 @@ func ensureClosed(player string) error {
 	return syscall.CloseHandle(handle)
 }
 
-// Files the user added to the installation directory are kept.
+// Only recognized Unity data and the bundled appearance pack are managed here.
 func extraFiles(directory string, remote manifest) ([]string, error) {
-	return nil, nil
+	return windowsExtraFiles(directory, remote)
 }
 
 func install(directory, stage string, changes []entry, extras []string) error {
-	return apply(directory, stage, changes)
+	return apply(directory, stage, changes, extras...)
 }
 
 func launch(directory string) error {
