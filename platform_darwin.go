@@ -18,6 +18,10 @@ const (
 	updaterName = "AffdataEdit-Updater"
 )
 
+func linkedFile(info os.FileInfo) bool {
+	return info.Mode()&os.ModeSymlink != 0
+}
+
 // An updater beside AffdataEdit.app updates it; a downloaded updater installs
 // /Applications/AffdataEdit and copies itself there.
 func defaultInstallDir(self string) string {
@@ -58,7 +62,7 @@ func ensureClosed(player string) error {
 
 // Nothing of the user's belongs inside the app, so files a new build no longer has are removed.
 // Paths are relative to the app.
-func extraFiles(directory string, remote manifest) ([]string, error) {
+func extraFiles(directory string, remote manifest, _ string) ([]string, error) {
 	expected := map[string]bool{}
 	for _, file := range remote.Files {
 		expected[strings.ToLower(file.Path)] = true

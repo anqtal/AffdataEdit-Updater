@@ -164,7 +164,7 @@ func run(directory, source string) error {
 		}
 		changes = append(changes, file)
 	}
-	extras, err := extraFiles(directory, remote)
+	extras, err := extraFiles(directory, remote, source)
 	if err != nil {
 		return err
 	}
@@ -248,7 +248,7 @@ func validatePath(root, path string) error {
 		if err != nil && !os.IsNotExist(err) {
 			return err
 		}
-		if err == nil && info.Mode()&os.ModeSymlink != 0 {
+		if err == nil && linkedFile(info) {
 			return fmt.Errorf("refusing linked path: %s", current)
 		}
 	}
@@ -350,7 +350,7 @@ func copyFile(source, destination string) error {
 	return errors.Join(copyErr, out.Close())
 }
 
-func apply(root, stage string, files []entry, extras ...string) (result error) {
+func apply(root, stage string, files []entry, extras ...entry) (result error) {
 	type change struct {
 		target, backup   string
 		installed, saved bool
@@ -395,7 +395,21 @@ func apply(root, stage string, files []entry, extras ...string) (result error) {
 	}
 	// Removals share the replacement transaction: a failed install restores both.
 	for _, extra := range extras {
-		if _, err := save(extra); err != nil {
+		if !managedCleanupPath(extra.Path) {
+			return fmt.Errorf("refusing cleanup outside managed data: %s", extra.Path)
+		}
+		if err := validate(root, extra); err != nil {
+			return err
+		}
+		// Recheck after waiting for the editor: a user may have edited the file.
+		equal, err := matches(filepath.Join(root, filepath.FromSlash(extra.Path)), extra)
+		if err != nil {
+			return err
+		}
+		if !equal {
+			continue
+		}
+		if _, err := save(extra.Path); err != nil {
 			return err
 		}
 	}
