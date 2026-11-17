@@ -15,6 +15,12 @@ const (
 	updaterName = "AffdataEdit-Updater.exe"
 )
 
+func linkedFile(info os.FileInfo) bool {
+	attributes, ok := info.Sys().(*syscall.Win32FileAttributeData)
+	return info.Mode()&os.ModeSymlink != 0 ||
+		ok && attributes.FileAttributes&syscall.FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
 // The updater lives beside AffdataEdit.exe; a first install uses the updater's directory.
 func defaultInstallDir(self string) string {
 	return filepath.Dir(self)
@@ -54,11 +60,11 @@ func ensureClosed(player string) error {
 }
 
 // Only recognized Unity data and the bundled appearance pack are managed here.
-func extraFiles(directory string, remote manifest) ([]string, error) {
-	return windowsExtraFiles(directory, remote)
+func extraFiles(directory string, remote manifest, source string) ([]entry, error) {
+	return windowsExtraFiles(directory, remote, source)
 }
 
-func install(directory, stage string, changes []entry, extras []string) error {
+func install(directory, stage string, changes []entry, extras []entry) error {
 	return apply(directory, stage, changes, extras...)
 }
 

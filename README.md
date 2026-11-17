@@ -27,9 +27,15 @@ macOS 更新成功后自动关闭更新器所在的 Terminal 标签页；更新�
 ## Windows
 
 安装目录为更新器所在目录，包含 `AffdataEdit.exe` 和 `AffdataEdit-Updater.exe`。
-更新成功时清理新版清单中已移除的 Unity 生成数据文件，以及 `AffdataEdit_Data/StreamingAssets/Appearance`
-中的旧版内置外观资源（包含已移除的额外菱形）。不扫描用户的 `Background`、`Skin`、`Charts`、
-设置或其他清单外文件；同名自定义文件仍会按远程清单覆盖。替换发生错误时回滚本轮已替换和已清理的文件，
+根据安装目录的 `build-version.txt`，从清单同级的 `releases/<旧版本>.json` 读取上次安装版本的归档清单。
+仅清理旧清单中有、新清单中没有，且大小及 SHA-256 仍与旧清单一致的 Unity 生成数据文件和
+`AffdataEdit_Data/StreamingAssets/Appearance` 内置资源（包含已移除的额外菱形）。不遍历安装目录找文件删除。
+用户修改过的资源、未在旧清单中出现的文件，以及用户的 `Background`、`Skin`、`Charts`、设置和缓存均不参与清理。
+实际移除前会再次检查哈希，保留等待编辑器关闭期间被修改的文件。
+
+缺少有效版本号、归档不可用（最多等待15秒）或旧清单无法核实时，提示并跳过清理，继续普通更新。
+清理无法追溯旧清单未记录的更早残留，不根据文件名猜测所有权。
+同名自定义文件仍会按新版远程清单覆盖。替换发生错误时回滚本轮已替换和已清理的文件，
 并显示备份目录；强制终止时可从安装目录 `.affdata-update-*/old` 恢复备份。
 
 ## macOS
