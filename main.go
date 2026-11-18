@@ -209,13 +209,18 @@ func installSelf(self, directory string) error {
 		return nil
 	}
 	target := filepath.Join(directory, updaterName)
-	temp := target + ".new"
+	// Stage beside the destination for the rename, without opening a
+	// predictable path that could already be a link to another file.
+	stage, err := os.MkdirTemp(directory, ".affdata-update-self-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(stage)
+	temp := filepath.Join(stage, updaterName)
 	if err := copyFile(self, temp); err != nil {
-		os.Remove(temp)
 		return err
 	}
 	if err := os.Chmod(temp, 0755); err != nil {
-		os.Remove(temp)
 		return err
 	}
 	return os.Rename(temp, target)
